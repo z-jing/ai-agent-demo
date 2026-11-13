@@ -1,98 +1,65 @@
-// src/composables/useConversation.ts
-import { ref, watch } from 'vue';
-import type { Message } from './useChatStream';
 
-export interface Conversation {
-  id: string;
-  title: string;
-  messages: Message[];
-  createdAt: number;
+// 【修改】多会话管理 + localStorage 持久化 → 会话记录绑定的文档 boundDocIds
+import { ref, watch } from 'vue'
+import type { Message } from './useChatStream'
+
+interface Conversation {
+  id: string
+  title: string
+  messages: Message[]
+  boundDocIds: string[]          // 【新增】该会话关联的文档 id
+  updatedAt: number
 }
 
-const STORAGE_KEY = 'ai_conversations';
-
-function load(): Conversation[] {
-  try {
-    return JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
-  } catch {
-    return [];
-  }
-}
-
-function save(list: Conversation[]) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(list));
-}
-
-let convId = Date.now();
+const KEY = 'app:conversations'
+const CUR = 'app:currentConv'
 
 export function useConversation() {
-  const conversations = ref<Conversation[]>(load());
-  const activeId = ref<string>('');
+  const convs = ref<Conversation[]>(load())
+  const currentId = ref<string>(localStorage.getItem(CUR) || '')
 
-  // 新建会话
+  if (!currentId.value || !convs.value.find((c) => c.id === currentId.value)) {
+    const c = newConv()
+    convs.value.push(c); currentId.value = c.id
+  }
+
+  function load(): Conversation[] {
+    try { return JSON.parse(localStorage.getItem(KEY) || '[]') } catch { return [] }
+  }
+  function persist() {
+    localStorage.setItem(KEY, JSON.stringify(convs.value))
+    localStorage.setItem(CUR, currentId.value)
+  }
+  function newConv(): Conversation {
+    return { id: crypto.randomUUID(), title: '新对话', messages: [], boundDocIds: [], updatedAt: Date.now() }
+  }
+
+  function current() {
+    return convs.value.find((c) => c.id === currentId.value)!
+  }
   function create() {
-    const conv: Conversation = {
-      id: `conv-${++convId}`,
-      title: '新对话',
-      messages: [],
-      createdAt: Date.now(),
-    };
-    conversations.value.unshift(conv);
-    activeId.value = conv.id;
-    save(conversations.value);
-    return conv;
+    const c = newConv(); convs.value.push(c); currentId.value = c.id; persist(); return c
   }
-
-  // 删除会话
+  function switchTo(id: string) { currentId.value = id; persist() }
   function remove(id: string) {
-    const idx = conversations.value.findIndex((c) => c.id === id);
-    if (idx === -1) return;
-    conversations.value.splice(idx, 1);
-    if (activeId.value === id) {
-      activeId.value = conversations.value[0]?.id || '';
-    }
-    save(conversations.value);
+    convs.value = convs.value.filter((c) => c.id !== id)
+    if (currentId.value === id) currentId.value = convs.value[0]?.id || create().id
+    persist()
   }
-
-  // 获取当前会话
-  function getActive(): Conversation | undefined {
-    return conversations.value.find((c) => c.id === activeId.value);
+  function appendMessage(m: Message) {
+    const c = current()
+    c.messages.push(m)
+    if (c.title === '新对话' && m.role === 'user') c.title = m.content.slice(0, 16)
+    c.updatedAt = Date.now()
+    persist()
   }
-
-  // 更新当前会话的消息列表
-  function updateMessages(msgs: Message[]) {
-    const conv = getActive();
-    if (!conv) return;
-    conv.messages = msgs;
-    // 自动标题：取第一条用户消息前 15 字
-    if (conv.title === '新对话') {
-      const firstUser = msgs.find((m) => m.role === 'user');
-      if (firstUser) {
-        conv.title = firstUser.content.slice(0, 15);
-      }
-    }
-    save(conversations.value);
+  // 【新增】把某文档绑定进当前会话
+  function bindDoc(docId: string) {
+    const c = current()
+    if (!c.boundDocIds.includes(docId)) { c.boundDocIds.push(docId); persist() }
   }
+  function getBoundDocIds() { return current().boundDocIds }
 
-  // 切换会话
-  function switchTo(id: string) {
-    activeId.value = id;
-  }
-
-  // 初始化：如果没有会话则新建
-  if (conversations.value.length === 0) {
-    create();
-  } else if (!activeId.value) {
-    activeId.value = conversations.value[0].id;
-  }
-
-  return {
-    conversations,
-    activeId,
-    create,
-    remove,
-    getActive,
-    updateMessages,
-    switchTo,
-  };
+  watch(currentId, persist)
+  return { convs, currentId, current, create, switchTo, remove, appendMessage, bindDoc, getBoundDocIds }
 }

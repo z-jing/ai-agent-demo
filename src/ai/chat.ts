@@ -1,75 +1,62 @@
-// src/ai/chat.ts
 
-interface SendMessageOptions {
-  message: string;
-  onChunk: (chunk: string) => void;
-  onError: (error: string) => void;
-  onComplete: () => void;
-  abortSignal: AbortSignal;
+// 【修改】真实 fetch 流式封装（生产用）
+// 相比第2周：新增 system（注入 RAG 资料）与 history（多轮上下文）两个参数
+export interface ChatOptions {
+  prompt: string
+  system?: string                 // 【新增】RAG 检索到的资料拼成的系统提示词
+  history?: { role: 'user' | 'assistant'; content: string }[]  // 【新增】多轮上下文
+  signal?: AbortSignal
+  onToken: (delta: string) => void
+  onDone?: () => void
+  onError?: (e: unknown) => void
 }
 
-export function sendMessage({
-  message,
-  onChunk,
-  onError,
-  onComplete,
-  abortSignal,
-}: SendMessageOptions) {
-  const apiKey = import.meta.env.VITE_AI_API_KEY;
-  if (!apiKey) {
-    onError('未配置 API Key，请在 .env 中设置 VITE_AI_API_KEY');
-    return;
-  }
+const BASE = import.meta.env.VITE_AI_BASE_URL || 'https://api.deepseek.com'
+const KEY = import.meta.env.VITE_AI_API_KEY
+const MODEL = import.meta.env.VITE_AI_MODEL || 'deepseek-chat'
 
-  fetch('https://api.deepseek.com/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      model: 'deepseek-chat',
-      messages: [{ role: 'user', content: message }],
-      stream: true,
-    }),
-    signal: abortSignal,
-  })
-    .then((response) => {
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
-      }
-      const reader = response.body!.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
+export async function streamChat(opts: ChatOptions): Promise<void> {
+  const messages = [
+    ...(opts.system ? [{ role: 'system', content: opts.system }] : []), // 【新增】
+    ...(opts.history || []),                                            // 【新增】
+    { role: 'user', content: opts.prompt },
+  ]
 
-      function read() {
-        reader.read().then(({ done, value }) => {
-          if (done) {
-            onComplete();
-            return;
-          }
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split('\n');
-          buffer = lines.pop() || '';
-          for (const line of lines) {
-            if (line.startsWith('data: ') && line !== 'data: [DONE]') {
-              try {
-                const data = JSON.parse(line.slice(6));
-                const delta = data.choices?.[0]?.delta?.content || '';
-                if (delta) onChunk(delta);
-              } catch {
-                // 忽略解析失败的行
-              }
-            }
-          }
-          read();
-        });
-      }
-      read();
+  try {
+    const res = await fetch(`${BASE}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${KEY}`,
+        'Cache-Control': 'no-cache',
+      },
+      body: JSON.stringify({ model: MODEL, messages, stream: true }),
+      signal: opts.signal,
     })
-    .catch((err) => {
-      if (err.name !== 'AbortError') {
-        onError(err.message);
+    if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`)
+
+    const reader = res.body.getReader()
+    const decoder = new TextDecoder()
+    let buf = ''
+    while (true) {
+      const { value, done } = await reader.read()
+      if (done) break
+      buf += decoder.decode(value, { stream: true })
+      const lines = buf.split('\n')
+      buf = lines.pop() || ''
+      for (const line of lines) {
+        const s = line.trim()
+        if (!s.startsWith('data:')) continue
+        const payload = s.slice(5).trim()
+        if (payload === '[DONE]') { opts.onDone?.(); return }
+        try {
+          const delta = JSON.parse(payload).choices?.[0]?.delta?.content
+          if (delta) opts.onToken(delta)
+        } catch { /* 忽略半包 */ }
       }
-    });
+    }
+    opts.onDone?.()
+  } catch (e) {
+    opts.onError?.(e)
+  }
 }
